@@ -83,42 +83,51 @@ def _local_windows(handle, frames):
         pending.extend(incoming)
 
 
-def _channel_masks(bins, noise, previous, strength, floor, release):
-    masks = []
-    for channel in range(2):
-        updated = []
-        for index in range(SIZE):
-            amplitude = abs(bins[channel][index])
-            reference = noise[channel][index]*SIZE
-            desired = max(floor, 1-strength*reference/max(amplitude, 1e-30))
-            old = previous[channel][index]
-            updated.append(old*release+desired*(1-release))
-        masks.append(updated)
-    return masks
+def _joint_mask(bins, noise, previous, strength, floor, release):
+    """One conjugate-symmetric attenuation per bin from the joint power ratio.
+
+    Both channels share each bin's gain so the stereo image stays put. The mask
+    opens instantly to protect new transients and closes exponentially to avoid
+    abrupt spectral holes.
+    """
+    updated = [0.0]*SIZE
+    for index in range(SIZE//2+1):
+        signal = abs(bins[0][index])**2+abs(bins[1][index])**2
+        reference = noise[0][index]+noise[1][index]
+        desired = max(floor, 1-strength*reference/max(signal, 1e-30))
+        old = previous[index]
+        updated[index] = desired if desired > old else old*release+desired*(1-release)
+    for index in range(SIZE//2+1, SIZE):
+        updated[index] = updated[SIZE-index]
+    return updated
 
 
 def blocks(handle, frames, noise, strength, floor, release, block_frames=4096):
     if type(block_frames) is not int or not 1 <= block_frames <= 65536:
         raise ValueError('invalid denoise output block size')
-    previous = [[1.0]*SIZE for _ in range(2)]
+    previous = [1.0]*SIZE
     overlap = [[0.0]*SIZE for _ in range(2)]
+    weights = [0.0]*SIZE
     pending = array('f')
-    normalizer = sum(value*value for value in WINDOW)/HOP
     for origin, bins in _local_windows(handle, frames):
-        previous = _channel_masks(bins, noise, previous, strength, floor, release)
+        previous = _joint_mask(bins, noise, previous, strength, floor, release)
         restored = []
         for channel in range(2):
-            transformed = [value*previous[channel][i] for i, value in enumerate(bins[channel])]
+            transformed = [value*previous[index] for index, value in enumerate(bins[channel])]
             restored.append(fft(transformed, True))
         for index in range(SIZE):
+            window = WINDOW[index]
+            weights[index] += window*window
             for channel in range(2):
-                overlap[channel][index] += restored[channel][index].real*WINDOW[index]
+                overlap[channel][index] += restored[channel][index].real*window
         for local in range(HOP):
-            if 0 <= origin+local < frames:
+            if origin+local < frames:
+                weight = weights[local]
                 for channel in range(2):
-                    pending.append(overlap[channel][local]/normalizer)
+                    pending.append(overlap[channel][local]/weight)
         for channel in range(2):
             overlap[channel] = overlap[channel][HOP:]+[0.0]*HOP
+        weights = weights[HOP:]+[0.0]*HOP
         while len(pending) >= block_frames*2:
             yield pending[:block_frames*2]
             del pending[:block_frames*2]

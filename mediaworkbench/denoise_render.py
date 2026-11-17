@@ -58,12 +58,16 @@ def render(conn, plan_id, destination, at_ms=0, duration_ms=None, block_frames=4
                 handle.setnchannels(2)
                 handle.setsampwidth(2)
                 handle.setframerate(48000)
-                cursor = start
+                cursor = 0
                 occurrence = 0
-                for pcm in _request_blocks(source, frames, start, stop, plan['profile']['power'],
+                # The analysis grid and gain history run continuously from
+                # programme start; an audition simply keeps its own slice of
+                # the same stream, so it always matches the full delivery.
+                # block_frames only bounds each yielded I/O chunk.
+                for pcm in denoise_signal.blocks(source, frames, plan['profile']['power'],
                         settings['strength'], floor, release, block_frames):
                     length = len(pcm)//2
-                    left, right = max(start,cursor), min(stop,cursor+length)
+                    left, right = max(start, cursor), min(stop, cursor+length)
                     if left < right:
                         selected = pcm[(left-cursor)*2:(right-cursor)*2]
                         for local in range(right-left):
@@ -84,22 +88,3 @@ def render(conn, plan_id, destination, at_ms=0, duration_ms=None, block_frames=4
         os.link(output, target)
     return dict(plan_id=plan_id, revision=plan['snapshot']['project']['revision'],
                 path=str(target), sha256=checksum.hexdigest(), frames=stop-start, rate=48000, channels=2)
-
-
-def _request_blocks(source, frames, start, stop, noise, strength, floor, release, block_frames):
-    """Bound each request unit independently for prompt random-position auditions."""
-    from io import BytesIO
-    origin = start
-    source.seek(start*8)
-    while origin < stop:
-        length = min(block_frames, stop-origin)
-        raw = source.read(length*8)
-        if len(raw) != length*8:
-            raise ValueError('programme spool was truncated')
-        local = BytesIO(raw)
-        processed = denoise_signal.blocks(local, length, noise, strength, floor, release, block_frames)
-        for pcm in processed:
-            if len(pcm) % 2:
-                raise ValueError('incomplete stereo restoration output')
-            yield pcm
-        origin += length
